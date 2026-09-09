@@ -17,21 +17,36 @@ class FifoDeduplicationCalculator:
 
     def generate_dedup_hash(self, body_payload: Dict[str, Any]) -> str:
         logger.info(f"Calculating deterministic deduplication hash for group {self.message_group_id}")
-        
-        components: Set[Any] = set()
-        components.add(body_payload.get("transaction_id"))
-        components.add(body_payload.get("timestamp"))
 
-        # Upstream service passes nested context tags
-        tags = body_payload.get("client_context", {})
+        try:
+            components: Set[str] = set()
+            components.add(str(body_payload.get("transaction_id")))
+            components.add(str(body_payload.get("timestamp")))
 
-        # FAILS HERE: tags is a dict: {'ip': '10.0.0.1', 'region': 'us-east-1'}
-        # Python sets cannot contain unhashable types (dicts)
-        # Raises TypeError: unhashable type: 'dict'
-        components.add(tags)
+            # Upstream service passes nested context tags
+            tags = body_payload.get("client_context", {})
 
-        serialized = "".join(sorted([str(c) for c in components]))
-        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+            # tags may be a dict (or other unhashable structure such as a list).
+            # Convert it to a deterministic, hashable string representation using
+            # canonical JSON serialization (sorted keys) before adding it to the
+            # set, instead of inserting the raw unhashable object directly.
+            if isinstance(tags, (dict, list)):
+                tags_component = json.dumps(tags, sort_keys=True)
+            else:
+                tags_component = str(tags)
+            components.add(tags_component)
+
+            serialized = "".join(sorted(components))
+            return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+        except TypeError as exc:
+            logger.exception(
+                f"Failed to generate deduplication hash for group {self.message_group_id} "
+                f"due to an unhashable or unsupported payload structure: {exc}"
+            )
+            raise TypeError(
+                f"Unable to compute deduplication hash: payload contains an unsupported "
+                f"or unhashable structure. Original error: {exc}"
+            ) from exc
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     logger.info("Processing inbound outbound queue dispatcher event...")
@@ -47,7 +62,19 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     }
 
     calculator = FifoDeduplicationCalculator(message_group_id="PAYMENT_ROUTING")
-    dedup_id = calculator.generate_dedup_hash(event_payload)
+
+    try:
+        dedup_id = calculator.generate_dedup_hash(event_payload)
+    except TypeError as exc:
+        logger.exception(f"Deduplication hash generation failed for payload: {event_payload}")
+        return {
+            "statusCode": 500,
+            "body": json.dumps({
+                "error": "Failed to generate deduplication hash",
+                "details": str(exc)
+            })
+        }
+
     logger.info(f"Generated DeduplicationId: {dedup_id}")
 
     sqs_message = {
