@@ -17,7 +17,7 @@ class FifoDeduplicationCalculator:
 
     def generate_dedup_hash(self, body_payload: Dict[str, Any]) -> str:
         logger.info(f"Calculating deterministic deduplication hash for group {self.message_group_id}")
-        
+
         components: Set[Any] = set()
         components.add(body_payload.get("transaction_id"))
         components.add(body_payload.get("timestamp"))
@@ -25,10 +25,20 @@ class FifoDeduplicationCalculator:
         # Upstream service passes nested context tags
         tags = body_payload.get("client_context", {})
 
-        # FAILS HERE: tags is a dict: {'ip': '10.0.0.1', 'region': 'us-east-1'}
-        # Python sets cannot contain unhashable types (dicts)
-        # Raises TypeError: unhashable type: 'dict'
-        components.add(tags)
+        # Sets cannot contain unhashable types (dicts/lists), so convert the
+        # nested client_context dict into a deterministic, hashable string
+        # representation before adding it to the components set.
+        if tags:
+            try:
+                hashable_tags = json.dumps(tags, sort_keys=True)
+            except TypeError:
+                # Fallback for non-JSON-serializable values (e.g. custom objects)
+                logger.warning("client_context contains non-JSON-serializable values; falling back to str()")
+                hashable_tags = str(tags)
+        else:
+            hashable_tags = ""
+
+        components.add(hashable_tags)
 
         serialized = "".join(sorted([str(c) for c in components]))
         return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
@@ -47,7 +57,21 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     }
 
     calculator = FifoDeduplicationCalculator(message_group_id="PAYMENT_ROUTING")
-    dedup_id = calculator.generate_dedup_hash(event_payload)
+
+    try:
+        dedup_id = calculator.generate_dedup_hash(event_payload)
+    except Exception as exc:
+        logger.error(
+            f"Failed to generate deduplication hash for transaction "
+            f"{event_payload.get('transaction_id')}: {exc}",
+            exc_info=True
+        )
+        return {
+            "statusCode": 500,
+            "error": "DEDUP_HASH_GENERATION_FAILED",
+            "message": str(exc)
+        }
+
     logger.info(f"Generated DeduplicationId: {dedup_id}")
 
     sqs_message = {
