@@ -17,18 +17,27 @@ class FifoDeduplicationCalculator:
 
     def generate_dedup_hash(self, body_payload: Dict[str, Any]) -> str:
         logger.info(f"Calculating deterministic deduplication hash for group {self.message_group_id}")
-        
-        components: Set[Any] = set()
-        components.add(body_payload.get("transaction_id"))
-        components.add(body_payload.get("timestamp"))
+
+        components: Set[str] = set()
+        components.add(str(body_payload.get("transaction_id")))
+        components.add(str(body_payload.get("timestamp")))
 
         # Upstream service passes nested context tags
         tags = body_payload.get("client_context", {})
 
-        # FAILS HERE: tags is a dict: {'ip': '10.0.0.1', 'region': 'us-east-1'}
-        # Python sets cannot contain unhashable types (dicts)
-        # Raises TypeError: unhashable type: 'dict'
-        components.add(tags)
+        # Defensive validation: confirm client_context is a dict before serialization.
+        # Upstream producers may send varying shapes (per cookbook Handler 5), so we
+        # log a WARNING and coerce to an empty dict rather than crashing on drift.
+        if not isinstance(tags, dict):
+            logger.warning(
+                f"Expected 'client_context' to be a dict but got {type(tags).__name__}; "
+                "defaulting to empty dict for hashing purposes."
+            )
+            tags = {}
+
+        # Python sets cannot contain unhashable types (dicts), so serialize the
+        # nested dict into a deterministic, sorted JSON string before adding it.
+        components.add(json.dumps(tags, sort_keys=True))
 
         serialized = "".join(sorted([str(c) for c in components]))
         return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
@@ -47,7 +56,20 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     }
 
     calculator = FifoDeduplicationCalculator(message_group_id="PAYMENT_ROUTING")
-    dedup_id = calculator.generate_dedup_hash(event_payload)
+
+    try:
+        dedup_id = calculator.generate_dedup_hash(event_payload)
+    except (TypeError, ValueError) as exc:
+        # A single malformed payload should not crash the whole invocation.
+        # Fall back to a deterministic hash of the raw JSON-serialized event
+        # payload so a MessageDeduplicationId can still be produced.
+        logger.error(
+            f"Failed to generate dedup hash via primary strategy: {exc}. "
+            "Falling back to raw JSON serialization hashing."
+        )
+        fallback_serialized = json.dumps(event_payload, sort_keys=True, default=str)
+        dedup_id = hashlib.sha256(fallback_serialized.encode("utf-8")).hexdigest()
+
     logger.info(f"Generated DeduplicationId: {dedup_id}")
 
     sqs_message = {
