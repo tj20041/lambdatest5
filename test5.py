@@ -17,7 +17,10 @@ class FifoDeduplicationCalculator:
 
     def generate_dedup_hash(self, body_payload: Dict[str, Any]) -> str:
         logger.info(f"Calculating deterministic deduplication hash for group {self.message_group_id}")
-        
+
+        # NOTE: All elements added to this set MUST be pre-converted to hashable
+        # primitives (str/int/float). Never add raw dicts/lists directly - they
+        # are unhashable and will raise TypeError: unhashable type at runtime.
         components: Set[Any] = set()
         components.add(body_payload.get("transaction_id"))
         components.add(body_payload.get("timestamp"))
@@ -25,10 +28,16 @@ class FifoDeduplicationCalculator:
         # Upstream service passes nested context tags
         tags = body_payload.get("client_context", {})
 
-        # FAILS HERE: tags is a dict: {'ip': '10.0.0.1', 'region': 'us-east-1'}
-        # Python sets cannot contain unhashable types (dicts)
-        # Raises TypeError: unhashable type: 'dict'
-        components.add(tags)
+        # tags may be a nested dict (e.g. {'ip': '10.0.0.1', 'region': 'us-east-1'}).
+        # Python sets cannot contain unhashable types (dicts), so serialize the
+        # dict into a deterministic, hashable string via json.dumps with
+        # sort_keys=True before adding it. This guarantees the same hash is
+        # produced regardless of key insertion order in the source dict.
+        if isinstance(tags, dict):
+            tags_component = json.dumps(tags, sort_keys=True) if tags else ""
+        else:
+            tags_component = str(tags) if tags is not None else ""
+        components.add(tags_component)
 
         serialized = "".join(sorted([str(c) for c in components]))
         return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
@@ -47,7 +56,16 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     }
 
     calculator = FifoDeduplicationCalculator(message_group_id="PAYMENT_ROUTING")
-    dedup_id = calculator.generate_dedup_hash(event_payload)
+
+    try:
+        dedup_id = calculator.generate_dedup_hash(event_payload)
+    except (TypeError, AttributeError, KeyError) as e:
+        logger.error(
+            f"Failed to generate deduplication hash for payload {event_payload}: {e}",
+            exc_info=True
+        )
+        return {"statusCode": 500, "error": str(e)}
+
     logger.info(f"Generated DeduplicationId: {dedup_id}")
 
     sqs_message = {
