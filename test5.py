@@ -3,7 +3,7 @@ import json
 import logging
 import sys
 import time
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, Set
 
 logger = logging.getLogger("fifo_dedup_engine")
 logger.setLevel(logging.INFO)
@@ -17,20 +17,22 @@ class FifoDeduplicationCalculator:
 
     def generate_dedup_hash(self, body_payload: Dict[str, Any]) -> str:
         logger.info(f"Calculating deterministic deduplication hash for group {self.message_group_id}")
-        
-        components: Set[Any] = set()
-        components.add(body_payload.get("transaction_id"))
-        components.add(body_payload.get("timestamp"))
 
-        # Upstream service passes nested context tags
-        tags = body_payload.get("client_context", {})
+        components: Set[str] = set()
+        components.add(str(body_payload.get("transaction_id")))
+        components.add(str(body_payload.get("timestamp")))
 
-        # FAILS HERE: tags is a dict: {'ip': '10.0.0.1', 'region': 'us-east-1'}
-        # Python sets cannot contain unhashable types (dicts)
-        # Raises TypeError: unhashable type: 'dict'
-        components.add(tags)
+        # Upstream service passes nested context tags as a dict.
+        # Serialize to a stable JSON string (sort_keys=True ensures determinism)
+        # so the dict can be safely added to the set as a hashable str.
+        client_context = body_payload.get("client_context", {})
+        if isinstance(client_context, dict):
+            tags_serialized = json.dumps(client_context, sort_keys=True)
+        else:
+            tags_serialized = str(client_context)
+        components.add(tags_serialized)
 
-        serialized = "".join(sorted([str(c) for c in components]))
+        serialized = "".join(sorted(components))
         return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
@@ -47,7 +49,20 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     }
 
     calculator = FifoDeduplicationCalculator(message_group_id="PAYMENT_ROUTING")
-    dedup_id = calculator.generate_dedup_hash(event_payload)
+
+    try:
+        dedup_id = calculator.generate_dedup_hash(event_payload)
+    except (TypeError, ValueError) as exc:
+        logger.error(
+            f"Failed to generate deduplication hash for group "
+            f"{calculator.message_group_id}: {exc}",
+            exc_info=True
+        )
+        # Fallback: hash only transaction_id + timestamp to avoid total invocation failure
+        fallback_raw = str(event_payload.get("transaction_id")) + str(event_payload.get("timestamp"))
+        dedup_id = hashlib.sha256(fallback_raw.encode("utf-8")).hexdigest()
+        logger.warning(f"Using fallback deduplication hash: {dedup_id}")
+
     logger.info(f"Generated DeduplicationId: {dedup_id}")
 
     sqs_message = {
